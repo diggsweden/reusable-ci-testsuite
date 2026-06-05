@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: 2026 Digg - Agency for Digital Government
+# SPDX-License-Identifier: CC0-1.0
+#
+# Integration tests
+#
+# Drives the testsuite's `go test -tags=integration ./tests/integration/...`
+# against a chosen `diggsweden/reusable-ci` ref. The testsuite's TestMain
+# builds the reusable-ci binary from the sibling checkout (or honours the
+# REUSABLE_CI env var when set), then runs every Test* in the package.
+#
+# Trigger surface (start-simple, expand later):
+#   - workflow_dispatch: manual run with optional reusable-ci-ref input
+#   - push to main: catches testsuite-side regressions against the default ref
+#   - pull_request to main: same, for PRs
+#   - schedule (daily): re-runs against the default ref to catch drift
+#
+# Default reusable-ci ref: while the Go rewrite is unreleased it is the
+# `feat/refactor-go` branch (see the resolve step). Restore the
+# releases/latest lookup once v3.0.0 ships.
+#
+# Why no language-specific toolchains here yet: many tests `requireTool`-
+# skip when the toolchain is absent, so a minimal runner exercises the
+# host-isolation / signing / planner / reproducibility / SBOM-discovery
+# layers and skips mvn/cargo/buildah/npm-specific paths cleanly. A
+# per-ecosystem matrix workflow is the natural follow-up.
+name: Integration Tests
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      reusable-ci-ref:
+        description: "diggsweden/reusable-ci ref (tag/branch/sha) to test against. Empty = feat/refactor-go (the Go rewrite branch)."
+        required: false
+        default: ""
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 04:00 UTC daily — catches reusable-ci releases that landed between
+    # testsuite commits. Cheap insurance against silent integration drift.
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel in-flight runs on a branch when a newer commit lands. Scheduled
+  # runs use a stable distinct group so a manual workflow_dispatch doesn't
+  # kill the nightly mid-flight (or vice versa).
+  group: integration-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    # Label matches the resolve step's actual behaviour: workflow_dispatch
+    # carries its override into the name; every other trigger falls through
+    # to the default ref (feat/refactor-go) in the resolve step.
+    name: "tests vs reusable-ci ${{ inputs['reusable-ci-ref'] || 'feat/refactor-go' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@002fdce3c6a235733a90a27c80493a3241e56863 # v2.12.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout testsuite
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: reusable-ci-testsuite
+          fetch-depth: 0
+
+      # Resolve which reusable-ci ref to test against, in order of
+      # precedence:
+      #   1. workflow_dispatch `reusable-ci-ref` input (explicit override)
+      #   2. everything else (push / PR / schedule): the DEFAULT_REF below.
+      # While the Go rewrite lives on a feature branch (pre-v3.0.0 release),
+      # the default is `feat/refactor-go` so every trigger exercises the Go
+      # code rather than the last bash release (which has no cmd/reusable-ci).
+      # Switch DEFAULT_REF back to a release-tag lookup once v3.0.0 ships.
+      - name: Resolve reusable-ci ref
+        id: resolve
+        env:
+          INPUT_REF: ${{ inputs['reusable-ci-ref'] }}
+          DEFAULT_REF: feat/refactor-go
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_REF}" ]; then
+            ref="${INPUT_REF}"
+            echo "::notice::Using workflow_dispatch override: ${ref}"
+          else
+            ref="${DEFAULT_REF}"
+            echo "::notice::Using default reusable-ci ref: ${ref}"
+          fi
+          echo "ref=${ref}" >>"$GITHUB_OUTPUT"
+
+      - name: Checkout reusable-ci
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: diggsweden/reusable-ci
+          ref: ${{ steps.resolve.outputs.ref }}
+          path: reusable-ci
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: reusable-ci-testsuite/go.mod
+          cache-dependency-path: |
+            reusable-ci-testsuite/go.sum
+            reusable-ci/go.sum
+
+      - name: Verify go vet (testsuite)
+        working-directory: reusable-ci-testsuite
+        run: go vet -tags=integration ./tests/integration/
+
+      - name: Run integration tests
+        working-directory: reusable-ci-testsuite
+        env:
+          # Some tests look for the runtime's `mise bin-paths` for tool
+          # discovery; if mise isn't installed, the helpers fall back
+          # cleanly to the host PATH. We don't install mise here — the
+          # GitHub runner ships with enough Go on PATH for TestMain to
+          # build the binary, and ecosystem-specific tests skip via
+          # `requireTool` when the toolchain isn't on PATH.
+          REUSABLE_CI_PROC_SWAPS: "/dev/null"
+        run: go test -tags=integration -count=1 -timeout 30m ./tests/integration/...
+
+      - name: Job summary
+        if: always()
+        env:
+          RESOLVED_REF: ${{ steps.resolve.outputs.ref }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          {
+            echo "## Integration Tests"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| reusable-ci ref | \`${RESOLVED_REF}\` |"
+            echo "| Trigger | \`${TRIGGER}\` |"
+            echo "| Testsuite SHA | \`${GITHUB_SHA}\` |"
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,5 @@
+# Pinned toolchain so CI and local dev build byte-identical binaries.
+# `reusable-ci validate cargo` requires this file (or a plain-text
+# `rust-toolchain` sibling) on every Cargo artefact.
+[toolchain]
+channel = "stable"

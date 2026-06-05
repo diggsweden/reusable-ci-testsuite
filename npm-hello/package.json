@@ -1,0 +1,6 @@
+{
+  "name": "@diggsweden/npm-hello",
+  "version": "0.1.0",
+  "description": "test fixture",
+  "main": "dist/cli.js"
+}
